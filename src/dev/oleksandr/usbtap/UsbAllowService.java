@@ -24,9 +24,12 @@ public class UsbAllowService extends AccessibilityService {
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
     private static final int FOX3D_PORT = 2525;
 
-    private static final String[] OK_TEXTS = {"ok", "ок", "allow", "разрешить"};
-    private static final String[] CANCEL_TEXTS = {"cancel", "отмена"};
-    private static final String[] ALLOW_WORDS = {"allow", "разрешить"};
+    // Device locale is uk-UA (confirmed via `adb shell getprop persist.sys.locale`), with
+    // en-US/ru as secondary - so the real dialog's button and prompt text render in Ukrainian.
+    // "OK" itself is commonly left untranslated across locales, hence "ok"/"ок" still cover it.
+    private static final String[] OK_TEXTS = {"ok", "ок", "allow", "разрешить", "дозволити"};
+    private static final String[] CANCEL_TEXTS = {"cancel", "отмена", "скасувати"};
+    private static final String[] ALLOW_WORDS = {"allow", "разрешить", "дозволити"};
 
     private boolean fox3dWebServerHandled = false;
 
