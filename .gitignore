@@ -1,0 +1,5 @@
+out/
+classes/
+gen/
+debug.keystore
+.DS_Store
