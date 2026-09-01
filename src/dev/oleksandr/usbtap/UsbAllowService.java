@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -27,9 +28,17 @@ public class UsbAllowService extends AccessibilityService {
     // Device locale is uk-UA (confirmed via `adb shell getprop persist.sys.locale`), with
     // en-US/ru as secondary - so the real dialog's button and prompt text render in Ukrainian.
     // "OK" itself is commonly left untranslated across locales, hence "ok"/"ок" still cover it.
+    // Confirmed on real hardware (full node dump via logcat) that TWO distinct SystemUI dialogs
+    // can appear back to back for one USB attach: the permission prompt itself - 'Надати додатку
+    // PrintHost доступ до такого аксесуара: USB Serial?' - and, right after granting it, a
+    // second "open the app for this accessory" confirmation - 'Відкрити додаток PrintHost, щоб
+    // використовувати такий аксесуар: USB Serial?'. Both use an "OK"/"СКАСУВАТИ" button pair but
+    // different verbs in the prompt sentence ("надати"="grant", "відкрити"="open") - neither is
+    // "дозволити" (used by other, unrelated Android permission dialogs, kept here regardless in
+    // case a future dialog variant does use it).
     private static final String[] OK_TEXTS = {"ok", "ок", "allow", "разрешить", "дозволити"};
     private static final String[] CANCEL_TEXTS = {"cancel", "отмена", "скасувати"};
-    private static final String[] ALLOW_WORDS = {"allow", "разрешить", "дозволити"};
+    private static final String[] ALLOW_WORDS = {"allow", "разрешить", "дозволити", "надати", "відкрити"};
 
     private boolean fox3dWebServerHandled = false;
 
@@ -51,6 +60,8 @@ public class UsbAllowService extends AccessibilityService {
             return;
         }
         CharSequence packageName = event.getPackageName();
+        Log.d(TAG, "onAccessibilityEvent type=" + type + " pkg=" + packageName
+                + " windowId=" + event.getWindowId());
         if (packageName == null) return;
 
         if (FOX3D_PACKAGE.contentEquals(packageName) && !fox3dWebServerHandled) {
@@ -59,7 +70,7 @@ public class UsbAllowService extends AccessibilityService {
         }
 
         if (SYSTEMUI_PACKAGE.contentEquals(packageName)) {
-            handleSystemUiWindow();
+            handleSystemUiWindow(event.getWindowId());
         }
     }
 
@@ -83,15 +94,28 @@ public class UsbAllowService extends AccessibilityService {
      * never fall back to guessing a button - if a real prompt was detected but no button
      * explicitly matches OK_TEXTS, do nothing rather than clicking something unknown.
      */
-    private void handleSystemUiWindow() {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
+    private void handleSystemUiWindow(int windowId) {
+        AccessibilityNodeInfo root = resolveRoot(windowId);
+        if (root == null) {
+            Log.d(TAG, "handleSystemUiWindow: no root found for windowId=" + windowId);
+            return;
+        }
         try {
             List<AccessibilityNodeInfo> textNodes = new ArrayList<>();
             List<AccessibilityNodeInfo> buttonNodes = new ArrayList<>();
             collect(root, textNodes, buttonNodes);
 
+            for (AccessibilityNodeInfo n : textNodes) {
+                Log.d(TAG, "textNode: [" + n.getClassName() + "] \"" + n.getText() + "\"");
+            }
+            for (AccessibilityNodeInfo n : buttonNodes) {
+                Log.d(TAG, "buttonNode: [" + n.getClassName() + "] \"" + n.getText() + "\" id="
+                        + n.getViewIdResourceName());
+            }
+
             if (!looksLikeUsbPermissionPrompt(textNodes) || buttonNodes.isEmpty()) {
+                Log.d(TAG, "not a recognized USB prompt (looksLike=" + looksLikeUsbPermissionPrompt(textNodes)
+                        + " buttons=" + buttonNodes.size() + ")");
                 return;
             }
 
@@ -111,6 +135,30 @@ public class UsbAllowService extends AccessibilityService {
         } finally {
             root.recycle();
         }
+    }
+
+    /**
+     * getRootInActiveWindow() can legitimately return null right as a brand-new window (like
+     * SystemUI's UsbPermissionActivity) first appears - "active window" tracking can lag one
+     * frame behind the WINDOW_STATE_CHANGED event that just fired for it. Confirmed on real
+     * hardware: the USB permission prompt reliably failed to get tapped with zero log output,
+     * meaning this early-return was silently eating every attempt. Falling back to the specific
+     * window named by the event itself (via getWindows(), matched by ID) finds the same content
+     * without depending on "active window" tracking having caught up yet.
+     */
+    private AccessibilityNodeInfo resolveRoot(int windowId) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null) return root;
+        for (AccessibilityWindowInfo window : getWindows()) {
+            if (window.getId() == windowId) {
+                AccessibilityNodeInfo fallbackRoot = window.getRoot();
+                if (fallbackRoot != null) {
+                    Log.d(TAG, "resolveRoot: getRootInActiveWindow() was null, used getWindows() fallback");
+                    return fallbackRoot;
+                }
+            }
+        }
+        return null;
     }
 
     /** True only for a node whose own text names both "usb" and an allow/разрешить word
