@@ -83,10 +83,27 @@ public class UsbAllowService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         int type = event.getEventType();
-        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            return;
+        boolean isWindowEvent = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED;
+        boolean isActivityEvent = type == AccessibilityEvent.TYPE_VIEW_CLICKED
+                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED
+                || type == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START;
+        if (!isWindowEvent && !isActivityEvent) return;
+
+        // While we're the one keeping the screen awake (wakeLock held by us), ANY UI activity -
+        // not just SystemUI's - means the user is actively using the phone right now, so keep
+        // deferring the auto-lock instead of yanking the screen out from under them mid-task.
+        // Confirmed as a real bug on real hardware: the auto-lock timer, once started by an
+        // earlier SystemUI event, kept ticking down on its own schedule while the user was
+        // actively tapping around in Settings afterward - this service had no way to know they
+        // were still there, since it only ever looked at SystemUI's own events.
+        if (wakeLock != null && wakeLock.isHeld() && System.currentTimeMillis() >= ignoreSystemUiEventsUntil) {
+            handler.removeCallbacks(turnScreenBackOff);
+            handler.postDelayed(turnScreenBackOff, SCREEN_OFF_DELAY_MS);
         }
+
+        if (!isWindowEvent) return; // the dialog-detection logic below only cares about windows
+
         CharSequence packageName = event.getPackageName();
         Log.d(TAG, "onAccessibilityEvent type=" + type + " pkg=" + packageName
                 + " windowId=" + event.getWindowId());
