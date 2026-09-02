@@ -1,6 +1,10 @@
 package dev.oleksandr.usbtap;
 
 import android.accessibilityservice.AccessibilityService;
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -40,7 +44,24 @@ public class UsbAllowService extends AccessibilityService {
     private static final String[] CANCEL_TEXTS = {"cancel", "отмена", "скасувати"};
     private static final String[] ALLOW_WORDS = {"allow", "разрешить", "дозволити", "надати", "відкрити"};
 
+    // How long to keep the screen on after the last relevant SystemUI event, before turning it
+    // back off ourselves - long enough to cover the permission prompt AND the follow-up "open
+    // the app" prompt that showed up ~2.3s after it on real hardware, short enough not to defeat
+    // the point of the phone normally sleeping.
+    private static final long SCREEN_OFF_DELAY_MS = 5000;
+
     private boolean fox3dWebServerHandled = false;
+    private PowerManager.WakeLock wakeLock;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    // Lambdas/method-refs don't compile with this project's javac+bootclasspath setup (no
+    // java.lang.invoke.LambdaMetafactory - confirmed in PrintHost's build) - anonymous class,
+    // same as everywhere else in this codebase.
+    private final Runnable turnScreenBackOff = new Runnable() {
+        @Override
+        public void run() {
+            releaseWakeLockAndLockScreen();
+        }
+    };
 
     @Override
     public void onInterrupt() {
@@ -95,6 +116,16 @@ public class UsbAllowService extends AccessibilityService {
      * explicitly matches OK_TEXTS, do nothing rather than clicking something unknown.
      */
     private void handleSystemUiWindow(int windowId) {
+        // Confirmed on real hardware (PRINTHOST_STATUS.md): with the screen off, this dialog
+        // pops up but usbtap can't tap it - Android doesn't reliably render/lay out a new
+        // window's content while the display itself is off, so the node tree below can come
+        // back empty or stale. Wake first, then read - and keep the screen awake a few seconds
+        // past the last SystemUI event in case a follow-up dialog (like the "open the app"
+        // confirmation that showed up ~2.3s after the permission prompt) is still coming.
+        wakeScreenIfAsleep();
+        handler.removeCallbacks(turnScreenBackOff);
+        handler.postDelayed(turnScreenBackOff, SCREEN_OFF_DELAY_MS);
+
         AccessibilityNodeInfo root = resolveRoot(windowId);
         if (root == null) {
             Log.d(TAG, "handleSystemUiWindow: no root found for windowId=" + windowId);
@@ -135,6 +166,35 @@ public class UsbAllowService extends AccessibilityService {
         } finally {
             root.recycle();
         }
+    }
+
+    /** Wakes the screen (if it's currently off) so the dialog can actually be read and tapped -
+     *  a no-op, cheap check when the screen is already on. */
+    @SuppressWarnings("deprecation") // SCREEN_BRIGHT_WAKE_LOCK has no non-deprecated replacement
+    private void wakeScreenIfAsleep() {
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (powerManager == null || powerManager.isInteractive()) return;
+        if (wakeLock == null) {
+            wakeLock = powerManager.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                            | PowerManager.ON_AFTER_RELEASE,
+                    "UsbTap:usbPrompt");
+        }
+        if (!wakeLock.isHeld()) {
+            wakeLock.acquire(30_000); // safety timeout - turnScreenBackOff() normally releases it first
+            Log.d(TAG, "Woke the screen for a SystemUI dialog");
+        }
+    }
+
+    /** Undoes wakeScreenIfAsleep(): releases the wake lock and locks the screen back off, rather
+     *  than just letting it idle-timeout on its own (which could take much longer). Runs once
+     *  SCREEN_OFF_DELAY_MS has passed with no further relevant SystemUI event. */
+    private void releaseWakeLockAndLockScreen() {
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
+        performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN);
+        Log.d(TAG, "Turned the screen back off");
     }
 
     /**

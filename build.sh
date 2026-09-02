@@ -16,7 +16,7 @@ echo "== aapt2 compile =="
 echo "== aapt2 link =="
 "$BT/aapt2" link -o out/base.apk -I "$PLATFORM" --manifest AndroidManifest.xml \
   -R out/compiled_res.zip --auto-add-overlay --java gen \
-  --min-sdk-version 26 --target-sdk-version 34
+  --min-sdk-version 28 --target-sdk-version 34
 
 echo "== javac =="
 "$JAVA_HOME/bin/javac" -source 8 -target 8 -parameters -encoding UTF-8 \
