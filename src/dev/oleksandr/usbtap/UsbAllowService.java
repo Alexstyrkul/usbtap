@@ -1,7 +1,10 @@
 package dev.oleksandr.usbtap;
 
 import android.accessibilityservice.AccessibilityService;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.PowerManager;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
@@ -43,14 +46,39 @@ public class UsbAllowService extends AccessibilityService {
     private static final String[] CANCEL_TEXTS = {"cancel", "отмена", "скасувати"};
     private static final String[] ALLOW_WORDS = {"allow", "разрешить", "дозволити", "надати", "відкрити"};
 
-    // Not a "how long to stay awake" timer - see holdScreenAwake()/releaseScreenHold() for the
-    // actual state-based approach this replaced. This is only a safety net against something
-    // going permanently wrong (a node match that never fires, an exception, or the user simply
-    // never acting at all) holding the screen on forever and draining the battery.
-    private static final long WAKE_LOCK_SAFETY_CEILING_MS = 5 * 60_000;
+    // Debounce for telling "the screen has genuinely been asleep for a while, a new dialog
+    // appearing is worth waking for" apart from "the screen JUST turned off because the user
+    // pressed the power button to lock it". Confirmed as a real bug on real hardware: pressing
+    // power to lock turns the display off essentially synchronously, but the SystemUI window
+    // event for the resulting keyguard becoming the active window arrives at this listener
+    // afterward - by then isInteractive() already reports false, making that event
+    // indistinguishable from "a real dialog just appeared after a long idle" by event data alone.
+    // Requiring the screen to have been off for at least this long already closes that race
+    // without needing to read window content first (which isn't reliably possible while asleep
+    // anyway - see wakeScreenIfAsleep()'s own comment).
+    //
+    // A first attempt tracked this off of accessibility events themselves (updating a "last seen
+    // interactive" timestamp whenever one arrived while the screen was on) - confirmed on real
+    // hardware to be unreliable: with no events at all during a quiet stretch of the screen just
+    // sitting on, that timestamp went stale past the debounce window on its own, so the very next
+    // event - even a totally ordinary one, nothing to do with locking - read as "screen has been
+    // off a while" the instant the user actually turned it off. ACTION_SCREEN_OFF/_ON are the
+    // real, immediate system signal for this and don't have that gap.
+    private static final long GENUINE_SLEEP_DEBOUNCE_MS = 800;
+    private volatile long screenTurnedOffAt = 0; // 0 = currently on (or not yet known off)
+
+    private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+                screenTurnedOffAt = System.currentTimeMillis();
+            } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                screenTurnedOffAt = 0;
+            }
+        }
+    };
 
     private boolean fox3dWebServerHandled = false;
-    private PowerManager.WakeLock wakeLock;
 
     @Override
     public void onInterrupt() {
@@ -59,49 +87,61 @@ public class UsbAllowService extends AccessibilityService {
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        registerReceiver(screenStateReceiver, filter);
+        // If the service is (re)starting while the screen already happens to be off (e.g. an
+        // app update while asleep), there was no ACTION_SCREEN_OFF to catch - treat it as
+        // "already been off a while" (1, not System.currentTimeMillis(), so the debounce math
+        // below is trivially satisfied) rather than defaulting to "just turned off".
+        screenTurnedOffAt = isAsleep() ? 1L : 0L;
         Log.d(TAG, "Service connected");
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        try {
+            unregisterReceiver(screenStateReceiver);
+        } catch (IllegalArgumentException e) {
+            // wasn't registered - nothing to do
+        }
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         int type = event.getEventType();
-        boolean isWindowEvent = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED;
-        boolean isActivityEvent = type == AccessibilityEvent.TYPE_VIEW_CLICKED
-                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED
-                || type == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START;
-        if (!isWindowEvent && !isActivityEvent) return;
-
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            return;
+        }
         CharSequence packageName = event.getPackageName();
         if (packageName == null) return;
 
-        // State-based, not timer-based: hold the screen awake for as long as the whole "printer
-        // just got physically attached, wait for a human to notice and press Connect whenever
-        // they get to it, then tap whatever dialog shows up" flow is still going, not for a
-        // fixed guess at how long that takes - it can't be guessed, since it's entirely up to
-        // the human. PrintHost's own MainActivity showing (the native, Android-triggered result
-        // of physically attaching the printer - not something this service starts) and any
-        // SystemUI window/activity both count as "still in progress". Once already holding for
-        // this flow, activity in ANY other app (e.g. the user switched over to Settings) also
-        // counts as "still around" rather than "walked away" - only releaseScreenHold(), called
-        // after successfully tapping a real dialog, lets it go from here.
+        // Confirmed as a real bug on real hardware, through two different designs before this
+        // one: holding a screen-type wake lock across the whole attach-to-tap flow - whether or
+        // not it carried ACQUIRE_CAUSES_WAKEUP - blocks the physical power button from locking
+        // the phone at all for as long as it's held. The user was explicit that being able to
+        // lock the phone manually at any moment is a hard requirement, so this doesn't hold
+        // anything: it only ever triggers a brief, one-shot wake-up transition when a genuinely
+        // new relevant window (PrintHost's MainActivity - the native, Android-triggered result of
+        // physically attaching the printer, not something this service starts - or a SystemUI
+        // dialog) appears while the screen is asleep. From that wake onward, Android's own normal
+        // screen timeout governs, same as if the user had pressed the power button themselves -
+        // and pressing it to lock always works, since nothing here is ever held.
+        boolean asleep = isAsleep();
+        long offAt = screenTurnedOffAt;
+        boolean genuinelyAsleep = asleep
+                && offAt != 0 && System.currentTimeMillis() - offAt > GENUINE_SLEEP_DEBOUNCE_MS;
+
         boolean relevantPackage = SYSTEMUI_PACKAGE.contentEquals(packageName)
                 || PRINTHOST_PACKAGE.contentEquals(packageName);
-        boolean alreadyHolding = wakeLock != null && wakeLock.isHeld();
-        if (relevantPackage || alreadyHolding) {
-            // The lock screen keeps generating its own CONTENT_CHANGED events while the display
-            // is off - its clock ticking over a minute, the battery percentage updating while
-            // charging - confirmed on real hardware as a real cause of the screen waking itself
-            // for no reason. A brand-new window (the actual dialog, or MainActivity appearing)
-            // always arrives as STATE_CHANGED; skip waking for a mere CONTENT_CHANGED update
-            // while still asleep, since it's never the thing worth waking up for.
-            if (!(isAsleep() && type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
-                holdScreenAwake();
-            }
+        if (relevantPackage && genuinelyAsleep && type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            wakeScreenIfAsleep();
         }
 
-        if (!isWindowEvent) return; // the dialog-detection logic below only cares about windows
-        if (isAsleep()) return; // can't reliably read a window's content while the display is off
+        if (asleep) return; // can't reliably read a window's content while the display is off
 
         Log.d(TAG, "onAccessibilityEvent type=" + type + " pkg=" + packageName
                 + " windowId=" + event.getWindowId());
@@ -137,9 +177,9 @@ public class UsbAllowService extends AccessibilityService {
      * explicitly matches OK_TEXTS, do nothing rather than clicking something unknown.
      */
     private void handleSystemUiWindow(int windowId) {
-        // Waking for this window (if it was needed) and holding the screen for it already
-        // happened in onAccessibilityEvent before this method was even called - this method only
-        // has to worry about reading and tapping the actual dialog content.
+        // Waking for this window (if it was needed) already happened in onAccessibilityEvent
+        // before this method was even called - this method only has to worry about reading and
+        // tapping the actual dialog content.
         AccessibilityNodeInfo root = resolveRoot(windowId);
         if (root == null) {
             Log.d(TAG, "handleSystemUiWindow: no root found for windowId=" + windowId);
@@ -177,47 +217,32 @@ public class UsbAllowService extends AccessibilityService {
             }
             Log.d(TAG, "Clicking USB permission OK button: " + okButton.getText());
             okButton.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            // Job done for this dialog - let go. If a follow-up dialog (like the "open the app"
-            // confirmation that shows up ~2.3s after the permission prompt) is still coming, its
-            // own STATE_CHANGED window event re-acquires the hold on its own; nothing is missed
-            // by releasing eagerly here rather than waiting to see if one shows up.
-            releaseScreenHold();
         } finally {
             root.recycle();
         }
     }
 
     /**
-     * State-based screen hold for the whole attach-to-tap flow - see onAccessibilityEvent's
-     * comment for why this replaced an earlier fixed-timer approach. Idempotent: safe to call
-     * repeatedly as new relevant events keep arriving, each call simply refreshes the safety
-     * ceiling rather than stacking additional wake time.
+     * A brief, one-shot wake-up transition - nothing is held afterward. Two earlier designs both
+     * held a screen-type wake lock across the whole attach-to-tap flow (first with a fixed
+     * stay-awake timer, then state-based, released only after a successful dialog tap); both were
+     * confirmed on real hardware to block the physical power button from locking the phone at all
+     * for as long as anything was held, regardless of whether the lock itself carried
+     * ACQUIRE_CAUSES_WAKEUP. Since being able to lock the phone manually at any moment is a hard
+     * requirement, this holds nothing: from the moment of this wake, Android's own normal screen
+     * timeout governs, exactly as if the user had pressed the power button themselves - which
+     * means pressing it again to lock always works too, since there's nothing left to fight it.
      */
     @SuppressWarnings("deprecation") // SCREEN_BRIGHT_WAKE_LOCK has no non-deprecated replacement
-    private void holdScreenAwake() {
+    private void wakeScreenIfAsleep() {
         PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (powerManager == null) return;
-        if (wakeLock == null) {
-            wakeLock = powerManager.newWakeLock(
-                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP
-                            | PowerManager.ON_AFTER_RELEASE,
-                    "UsbTap:usbFlow");
-        }
-        if (wakeLock.isHeld()) {
-            wakeLock.release(); // acquire(timeout) doesn't refresh an already-held lock's timer
-        } else {
-            Log.d(TAG, "Holding screen awake for the attach-to-tap flow");
-        }
-        wakeLock.acquire(WAKE_LOCK_SAFETY_CEILING_MS);
-    }
-
-    /** Lets go once the actual job (tapping a real dialog) is done - Android's own normal screen
-     *  timeout governs from here, not an artificial window picked by us. */
-    private void releaseScreenHold() {
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
-            Log.d(TAG, "Released screen hold - dialog handled");
-        }
+        PowerManager.WakeLock oneShot = powerManager.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "UsbTap:wakeupTrigger");
+        oneShot.acquire(1000);
+        oneShot.release();
+        Log.d(TAG, "Woke the screen for a relevant window appearing");
     }
 
     private boolean isAsleep() {
