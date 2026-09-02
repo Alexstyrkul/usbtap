@@ -102,7 +102,7 @@ public class UsbAllowService extends AccessibilityService {
                 Log.d(TAG, "Ignoring SystemUI event - likely an echo of our own lock action");
                 return;
             }
-            handleSystemUiWindow(event.getWindowId());
+            handleSystemUiWindow(event.getWindowId(), type);
         }
     }
 
@@ -126,7 +126,23 @@ public class UsbAllowService extends AccessibilityService {
      * never fall back to guessing a button - if a real prompt was detected but no button
      * explicitly matches OK_TEXTS, do nothing rather than clicking something unknown.
      */
-    private void handleSystemUiWindow(int windowId) {
+    private void handleSystemUiWindow(int windowId, int eventType) {
+        // The lock screen keeps generating its own CONTENT_CHANGED events while the display is
+        // off - its clock ticking over a minute, the battery percentage updating while charging
+        // - confirmed on real hardware as the actual cause of a screen that kept blinking back
+        // on every few seconds with nothing relevant to tap: this method was waking for every
+        // one of those, each restarting the 5s "stay awake" timer. Both real dialogs (the USB
+        // permission prompt and the follow-up "open the app" confirmation) always arrived as
+        // STATE_CHANGED - a genuinely new window appearing - never as a CONTENT_CHANGED update to
+        // the already-visible lock screen. So while asleep, only a STATE_CHANGED is worth waking
+        // for; a CONTENT_CHANGED that arrives while already awake (screen on for some other
+        // reason) still gets read normally, since it's not the thing that was causing blinking.
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        boolean asleep = powerManager != null && !powerManager.isInteractive();
+        if (asleep && eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return;
+        }
+
         // Confirmed on real hardware (PRINTHOST_STATUS.md): with the screen off, this dialog
         // pops up but usbtap can't tap it - Android doesn't reliably render/lay out a new
         // window's content while the display itself is off, so the node tree below can come
