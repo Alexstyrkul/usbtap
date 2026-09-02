@@ -62,6 +62,13 @@ public class UsbAllowService extends AccessibilityService {
             releaseWakeLockAndLockScreen();
         }
     };
+    // Confirmed on real hardware: GLOBAL_ACTION_LOCK_SCREEN itself produces a fresh SystemUI
+    // window event (the PrintHost foreground-service notification re-rendering as part of the
+    // lock transition) - without this cooldown that event immediately re-wakes the screen,
+    // which reschedules another lock 5s later, which fires the same event again: an infinite
+    // wake/lock loop that looked like the screen "blinking but never turning off".
+    private static final long OWN_LOCK_ACTION_COOLDOWN_MS = 2000;
+    private long ignoreSystemUiEventsUntil = 0;
 
     @Override
     public void onInterrupt() {
@@ -91,6 +98,10 @@ public class UsbAllowService extends AccessibilityService {
         }
 
         if (SYSTEMUI_PACKAGE.contentEquals(packageName)) {
+            if (System.currentTimeMillis() < ignoreSystemUiEventsUntil) {
+                Log.d(TAG, "Ignoring SystemUI event - likely an echo of our own lock action");
+                return;
+            }
             handleSystemUiWindow(event.getWindowId());
         }
     }
@@ -193,6 +204,7 @@ public class UsbAllowService extends AccessibilityService {
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
         }
+        ignoreSystemUiEventsUntil = System.currentTimeMillis() + OWN_LOCK_ACTION_COOLDOWN_MS;
         performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN);
         Log.d(TAG, "Turned the screen back off");
     }
