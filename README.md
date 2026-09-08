@@ -20,9 +20,13 @@ third-party app's window apart from the system permission dialog.
 1. `./build.sh` (needs the Android SDK build-tools and `ANDROID_HOME` set;
    see the script for the exact tool versions it expects)
 2. `adb install -r out/signed.apk`
-3. Enable it under Settings → Accessibility → usbtap (it does nothing until
+3. **On Android 13+**, the toggle in step 4 is greyed out at first - this is
+   Android blocking sideloaded (non-Play-Store) apps from enabling an
+   accessibility service by default. Go to Settings → Apps → usbtap → the
+   ⋮ menu (top right) → "Allow restricted settings" first.
+4. Enable it under Settings → Accessibility → usbtap (it does nothing until
    this is turned on - Android accessibility services can't self-enable)
-4. If you also want the screen-lock button on PrintHost's dashboard to work,
+5. If you also want the screen-lock button on PrintHost's dashboard to work,
    no extra setup is needed - it works automatically once usbtap is enabled
 
 ## Why an accessibility service, and not a standard permission grant
@@ -35,11 +39,19 @@ handle this from an ordinary, unprivileged app.
 ## What this is not
 
 A general-purpose dialog-clicking bot. It only recognizes and taps the
-specific USB permission dialog (matched by its actual button text, in
-several languages actually encountered on a real device - not a blind
-"tap whatever's on screen"), plus one other app's window it's tuned to
+specific USB permission dialog (matched by its actual button text - not a
+blind "tap whatever's on screen"), plus one other app's window it's tuned to
 recognize. It won't do anything useful outside that.
+
+## Language support
+
+Button-text matching only recognizes the words actually seen on a real
+device so far: English ("Allow"/"OK"), Russian ("разрешить"), and Ukrainian
+("дозволити"/"надати"/"відкрити"). On a phone set to any other language, the
+dialog won't be recognized and won't get tapped. To add a language, add its
+words to `OK_TEXTS` and `ALLOW_WORDS` near the top of
+[`UsbAllowService.java`](src/dev/oleksandr/usbtap/UsbAllowService.java).
 
 ## License
 
-No license file yet - all rights reserved by default. Ask before reusing.
+MIT - see [LICENSE](LICENSE).
